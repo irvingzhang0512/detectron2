@@ -6,7 +6,7 @@ from torch import nn
 from torch.autograd.function import Function
 from torch.nn import functional as F
 
-from detectron2.utils import comm
+from detectron2.utils import comm, env
 
 from .wrappers import BatchNorm2d
 
@@ -127,7 +127,9 @@ class FrozenBatchNorm2d(nn.Module):
 def get_norm(norm, out_channels):
     """
     Args:
-        norm (str or callable):
+        norm (str or callable): either one of BN, SyncBN, FrozenBN, GN;
+            or a callable that takes a channel number and returns
+            the normalization layer as a nn.Module.
 
     Returns:
         nn.Module or None: the normalization layer
@@ -137,10 +139,13 @@ def get_norm(norm, out_channels):
             return None
         norm = {
             "BN": BatchNorm2d,
-            "SyncBN": NaiveSyncBatchNorm,
+            # Fixed in https://github.com/pytorch/pytorch/pull/36382
+            "SyncBN": NaiveSyncBatchNorm if env.TORCH_VERSION <= (1, 5) else nn.SyncBatchNorm,
             "FrozenBN": FrozenBatchNorm2d,
             "GN": lambda channels: nn.GroupNorm(32, channels),
-            "nnSyncBN": nn.SyncBatchNorm,  # keep for debugging
+            # for debugging:
+            "nnSyncBN": nn.SyncBatchNorm,
+            "naiveSyncBN": NaiveSyncBatchNorm,
         }[norm]
     return norm(out_channels)
 
@@ -162,13 +167,11 @@ class AllReduce(Function):
 
 class NaiveSyncBatchNorm(BatchNorm2d):
     """
-    `torch.nn.SyncBatchNorm` has known unknown bugs.
-    It produces significantly worse AP (and sometimes goes NaN)
-    when the batch size on each worker is quite different
+    In PyTorch<=1.5, ``nn.SyncBatchNorm`` has incorrect gradient
+    when the batch size on each worker is different.
     (e.g., when scale augmentation is used, or when it is applied to mask head).
 
-    Use this implementation before `nn.SyncBatchNorm` is fixed.
-    It is slower than `nn.SyncBatchNorm`.
+    This is a slower but correct alternative to `nn.SyncBatchNorm`.
 
     Note:
         There isn't a single definition of Sync BatchNorm.
@@ -213,16 +216,16 @@ class NaiveSyncBatchNorm(BatchNorm2d):
         else:
             if B == 0:
                 vec = torch.zeros([2 * C + 1], device=mean.device, dtype=mean.dtype)
+                vec = vec + input.sum()  # make sure there is gradient w.r.t input
             else:
                 vec = torch.cat(
                     [mean, meansqr, torch.ones([1], device=mean.device, dtype=mean.dtype)], dim=0
                 )
             vec = AllReduce.apply(vec * B)
 
-            total_batch = vec[-1]
-            momentum = (
-                total_batch.detach().clamp(max=1) * self.momentum
-            )  # no update if total_batch is 0
+            total_batch = vec[-1].detach()
+            momentum = total_batch.clamp(max=1) * self.momentum  # no update if total_batch is 0
+            total_batch = torch.max(total_batch, torch.ones_like(total_batch))  # avoid div-by-zero
             mean, meansqr, _ = torch.split(vec / total_batch, C)
 
         var = meansqr - mean * mean
